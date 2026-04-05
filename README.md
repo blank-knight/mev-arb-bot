@@ -1,5 +1,7 @@
 # MEV 套利机器人
 
+**中文 | [English](README_EN.md)**
+
 Optimism L2 上的自动化 MEV 套利机器人，支持 DEX 套利和三明治攻击两种策略。
 
 ## 项目概述
