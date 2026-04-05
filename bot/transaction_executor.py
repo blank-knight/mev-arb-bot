@@ -63,6 +63,8 @@ class TradeResult:
     tx_hash: Optional[str] = None
     gas_used: int = 0
     error: Optional[str] = None
+    simulated: bool = False        # 是否经过本地 simulation
+    simulation_passed: bool = False  # simulation 结果
 
 
 class TransactionExecutor:
@@ -226,11 +228,29 @@ class TransactionExecutor:
                 min_profit,
             )
 
-        # 3. 估算 Gas
+        # 3. 本地 simulation（eth_call，零成本）
+        # 在发送前用 RPC 节点模拟执行，提前发现利润已消失的情况
+        # 避免发出注定 revert 的交易白白损失 Gas
+        sim = self._simulate(tx_func, sender)
+        if not sim["success"]:
+            logger.info("Simulation 失败，取消发送: %s", sim["reason"])
+            result = TradeResult(
+                timestamp=timestamp,
+                success=False,
+                decision=decision,
+                simulated=True,
+                simulation_passed=False,
+                error=f"simulation revert: {sim['reason']}",
+            )
+            return result
+
+        logger.debug("Simulation 通过，继续发送交易")
+
+        # 4. 估算 Gas
         gas_estimate = tx_func.estimate_gas({"from": sender})
         gas_limit = int(gas_estimate * 1.2)  # 20% 余量
 
-        # 4. 构造、签名、发送交易
+        # 5. 构造、签名、发送交易
         nonce = self.w3.eth.get_transaction_count(sender)
         gas_price = self.w3.eth.gas_price
 
@@ -248,7 +268,7 @@ class TransactionExecutor:
         tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
         logger.info("交易已发送: %s", tx_hash.hex())
 
-        # 5. 等待确认
+        # 6. 等待确认
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
 
         success = receipt["status"] == 1
@@ -269,6 +289,8 @@ class TransactionExecutor:
             decision=decision,
             tx_hash=tx_hash.hex(),
             gas_used=receipt["gasUsed"],
+            simulated=True,
+            simulation_passed=True,
             error=None if success else "Transaction reverted",
         )
 
@@ -314,6 +336,35 @@ class TransactionExecutor:
         tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
         self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
         logger.info("Approve 完成: %s", tx_hash.hex())
+
+    def _simulate(self, tx_func, sender: str) -> dict:
+        """
+        用 eth_call 在 RPC 节点本地模拟执行合约，不上链，不花 Gas。
+
+        为什么需要这个？
+        从"发现套利机会"到"交易真正上链"之间有 1~3 秒延迟。
+        在这段时间里，其他机器人可能已经抹平了价差，
+        合约内的利润检查（require balanceAfter > balanceBefore）会 revert。
+        eth_call 提前发现这种情况，避免发出注定失败的交易浪费 Gas。
+
+        eth_call vs 真实发交易：
+        - eth_call：RPC 节点在内存中跑一遍，结果返回给你，链上状态不变
+        - sendRawTransaction：广播到全网，Sequencer 打包，永久上链
+
+        返回：
+            {"success": True} 或 {"success": False, "reason": "..."}
+        """
+        try:
+            tx_func.call({"from": sender})
+            return {"success": True, "reason": None}
+        except Exception as e:
+            # 常见 revert 原因：
+            # "Profit too low"       → 价格在决策后已移动，利润消失
+            # "TransferFrom failed"  → allowance 不够（不应发生，_ensure_allowance 已处理）
+            # "execution reverted"   → 其他合约错误
+            reason = str(e)
+            logger.debug("Simulation revert: %s", reason)
+            return {"success": False, "reason": reason}
 
     def _dry_run(self, decision: TradeDecision, timestamp: float) -> TradeResult:
         """Dry-run 模式：只记录，不执行。"""
