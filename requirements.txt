@@ -1,0 +1,24 @@
+# 核心 Web3 交互
+web3>=6.11.0
+websockets>=12.0
+
+# 异步处理
+aiohttp>=3.9.0
+
+# 配置管理
+python-dotenv>=1.0.0
+
+# HTTP 请求
+requests>=2.31.0
+
+# Telegram 通知 (Phase 5)
+python-telegram-bot>=20.7
+
+# 测试
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+
+# 代码质量
+black>=23.12.0
+isort>=5.13.0

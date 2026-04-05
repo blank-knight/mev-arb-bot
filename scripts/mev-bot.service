@@ -1,0 +1,59 @@
+# ============================================================
+# MEV 套利机器人 - systemd 服务文件
+#
+# 安装步骤:
+#   1. 修改下方路径为实际部署路径
+#   2. sudo cp scripts/mev-bot.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable mev-bot    # 开机自启
+#   5. sudo systemctl start mev-bot     # 启动
+#
+# 常用命令:
+#   sudo systemctl status mev-bot       # 查看状态
+#   sudo journalctl -u mev-bot -f       # 实时日志
+#   sudo systemctl restart mev-bot      # 重启
+#   sudo systemctl stop mev-bot         # 停止
+# ============================================================
+
+[Unit]
+Description=MEV Arbitrage Bot (Optimism)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# === 修改以下路径 ===
+User=mev
+Group=mev
+WorkingDirectory=/home/mev/mev-arb-bot
+ExecStart=/home/mev/mev-arb-bot/.venv/bin/python main.py
+# ====================
+
+# 环境变量（从 .env 加载）
+EnvironmentFile=/home/mev/mev-arb-bot/.env
+
+# 自动重启
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# 优雅关闭（发 SIGTERM，等 30 秒）
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 安全加固
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/mev/mev-arb-bot/logs
+PrivateTmp=yes
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mev-bot
+
+[Install]
+WantedBy=multi-user.target
