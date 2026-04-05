@@ -136,18 +136,113 @@ sudo journalctl -u mev-bot -f
 
 ## 测试
 
+### 当前测试进度
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| 第一阶段 | 单元测试（不需要网络） | ✅ 完成：101 个测试全部通过 |
+| 第二阶段 | 主网只读查价（不花钱） | 待执行 |
+| 第三阶段 | Dry-run 持续监控（不花钱） | 待执行 |
+| 第四阶段 | 小额真实执行 | 待执行（需部署合约） |
+
+---
+
+### 第一阶段：单元测试（已完成）
+
+验证核心计算逻辑，不需要联网和私钥。
+
 ```bash
-# Python 测试（101 个）
 source .venv/bin/activate
 pytest tests/ -v
+# 结果：101 passed, 1 warning in 9.63s
+```
 
-# Foundry 合约测试（16 个）
+覆盖范围：套利利润计算、三明治价格影响估算、Gas 缓存、内存上限、nonce 锁、Telegram 通知队列、集成流程。
+
+Foundry 合约测试（需要安装 forge）：
+
+```bash
 cd contracts_sol
 forge test -v
-
-# Fork 主网集成测试（需要 RPC）
-forge test --match-test "Fork" -v --fork-url $OPTIMISM_RPC_HTTP
+# 结果：16 个合约测试全部通过
 ```
+
+---
+
+### 第二阶段：主网只读查价
+
+连接 Optimism 主网，查询真实价差，**不发任何交易，不花钱**。
+
+```bash
+# .env 中不需要填私钥
+cp .env.mainnet .env
+python scripts/check_prices.py --mainnet
+```
+
+输出示例：
+
+```
+Uniswap V3 Pool (0.3%): 0x85149247691df622eaF1a8Bd0CaFd40BC45154a
+Velodrome Pool (volatile): 0x79c912FEF520be002c2B6e57EC4324e260f38E50
+
+价格查询 (1000 USDC → WETH):
+  Uniswap V3:  0.000346 WETH
+  Velodrome:   0.000346 WETH
+  价差: 0.0041% → 价差不足，不执行套利
+
+1 WETH = 2893.12 USDC
+```
+
+**判断标准**：观察一段时间，价差是否有机会超过 0.3%（`MIN_PROFIT_THRESHOLD`）。
+
+---
+
+### 第三阶段：Dry-run 持续监控
+
+让机器人完整运行、模拟所有决策，但**不发送任何链上交易**。
+
+```bash
+python main.py --mainnet --poll --interval 10
+```
+
+持续运行 24~48 小时，观察日志中的统计数据：
+
+```
+[DRY RUN] 会执行套利: 在 velodrome 买, 在 uniswap 卖, 净利=$0.08
+跳过套利: 净利润为负 ($-0.02)
+```
+
+**判断是否值得真实部署的指标：**
+
+| 指标 | 建议标准 |
+|------|---------|
+| 每天触发信号次数 | 越多越好 |
+| 净利润 > 0 的占比 | > 20% 才值得部署 |
+| 平均净利润 | 需覆盖部署合约的 Gas 成本 |
+
+---
+
+### 第四阶段：小额真实执行
+
+Dry-run 数据良好后才进入此阶段：
+
+```bash
+# 1. 填写私钥和 Alchemy RPC
+vim .env
+
+# 2. 部署合约（约 $0.5 Gas）
+./scripts/deploy.sh --mainnet
+
+# 3. 将合约地址填入 .env 的 ARBITRAGE_CONTRACT
+
+# 4. preflight 检查
+python scripts/preflight.py
+
+# 5. 启动（ARBITRAGE_CONTRACT 有值后自动退出 dry-run 模式）
+python main.py --poll
+```
+
+建议初始资金：**$50~$100 USDC + 0.02 ETH**，验证逻辑后再加仓。
 
 ## 项目结构
 
