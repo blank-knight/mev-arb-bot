@@ -138,12 +138,25 @@ sudo journalctl -u mev-bot -f
 
 ### 当前测试进度
 
+#### DEX 套利
+
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| 第一阶段 | 单元测试（不需要网络） | ✅ 完成：101 个测试全部通过 |
+| 第一阶段 | 单元测试（不需要网络） | ✅ 完成：相关测试全部通过 |
 | 第二阶段 | 主网只读查价（不花钱） | 待执行 |
 | 第三阶段 | Dry-run 持续监控（不花钱） | 待执行 |
 | 第四阶段 | 小额真实执行 | 待执行（需部署合约） |
+
+#### 三明治攻击
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| 第一阶段 | 单元测试（Mock 数据） | ✅ 完成：解码、决策逻辑全部通过 |
+| 第二阶段 | WebSocket 连通性验证 | 待执行 |
+| 第三阶段 | 主网 Dry-run 捕获统计 | 待执行（**必须主网**） |
+| 第四阶段 | 小额真实执行 | 待执行（需部署合约） |
+
+> **注意**：三明治攻击第三、四阶段必须连接主网 Mempool，测试网流量极少，无法有效验证。
 
 ---
 
@@ -153,81 +166,135 @@ sudo journalctl -u mev-bot -f
 
 ```bash
 source .venv/bin/activate
+
+# 全部测试
 pytest tests/ -v
 # 结果：101 passed, 1 warning in 9.63s
+
+# 只跑三明治相关
+pytest tests/test_sandwich.py tests/test_integration.py -v
 ```
 
-覆盖范围：套利利润计算、三明治价格影响估算、Gas 缓存、内存上限、nonce 锁、Telegram 通知队列、集成流程。
+**DEX 套利覆盖**：利润计算、Gas 核算、滑点预留、二次确认逻辑、dry-run 模式。
 
-Foundry 合约测试（需要安装 forge）：
+**三明治攻击覆盖**：Mempool 交易解码（Uniswap / Velodrome 函数签名识别）、价格影响估算、Gas 过高跳过、价格影响过小跳过、dry-run 不触发真实回调、统计计数。
+
+Foundry 合约测试（需安装 forge）：
 
 ```bash
-cd contracts_sol
-forge test -v
+cd contracts_sol && forge test -v
 # 结果：16 个合约测试全部通过
 ```
 
 ---
 
-### 第二阶段：主网只读查价
+### 第二阶段：主网只读查价 + WebSocket 连通性
 
-连接 Optimism 主网，查询真实价差，**不发任何交易，不花钱**。
+**DEX 套利**：连接主网查询真实价差，不发任何交易。
 
 ```bash
-# .env 中不需要填私钥
-cp .env.mainnet .env
+cp .env.mainnet .env   # 不需要填私钥
 python scripts/check_prices.py --mainnet
 ```
 
 输出示例：
 
 ```
-Uniswap V3 Pool (0.3%): 0x85149247691df622eaF1a8Bd0CaFd40BC45154a
-Velodrome Pool (volatile): 0x79c912FEF520be002c2B6e57EC4324e260f38E50
-
 价格查询 (1000 USDC → WETH):
   Uniswap V3:  0.000346 WETH
   Velodrome:   0.000346 WETH
   价差: 0.0041% → 价差不足，不执行套利
-
-1 WETH = 2893.12 USDC
 ```
 
-**判断标准**：观察一段时间，价差是否有机会超过 0.3%（`MIN_PROFIT_THRESHOLD`）。
+**三明治攻击**：验证 WebSocket 能否接收 Mempool 中的 pending 交易。
+
+```bash
+# 用当前测试网 RPC 先验证 WebSocket 连通性
+python - << 'EOF'
+import asyncio, sys
+sys.path.insert(0, ".")
+from utils.config import Config
+from utils.web3_utils import ChainConnection
+from data.mempool_monitor import MempoolMonitor
+
+async def main():
+    config = Config.from_env()
+    conn = ChainConnection(config.optimism)
+    await conn.connect()
+    monitor = MempoolMonitor(conn, config)
+    count = 0
+
+    async def on_swap(swap):
+        nonlocal count
+        count += 1
+        print(f"[{count}] DEX={swap.dex} 金额={swap.amount_in_human:.0f} tx={swap.tx_hash[:18]}")
+
+    monitor.on_large_swap = on_swap
+    await monitor.start()
+    print("监听 30 秒...")
+    await asyncio.sleep(30)
+    await monitor.stop()
+    stats = monitor.get_stats()
+    print(f"统计: pending={stats['total_pending']}, swaps={stats['total_swaps']}, 大额={stats['total_large_swaps']}")
+
+asyncio.run(main())
+EOF
+```
+
+结果解读：
+
+| 输出 | 说明 |
+|------|------|
+| `pending=0` | WebSocket 未连上，检查 RPC 配置 |
+| `pending>0, swaps=0` | 连通正常，测试网无 DEX 流量（正常现象） |
+| `pending>0, large_swaps>0` | 完全正常，可以进入第三阶段 |
 
 ---
 
 ### 第三阶段：Dry-run 持续监控
 
-让机器人完整运行、模拟所有决策，但**不发送任何链上交易**。
+让机器人完整运行、模拟所有决策，**不发送任何链上交易**。
+
+**DEX 套利 + 三明治同时监控**（推荐切换到主网 RPC）：
 
 ```bash
-python main.py --mainnet --poll --interval 10
+# 切换主网配置（三明治必须主网才有真实流量）
+cp .env.mainnet .env
+
+python main.py --poll --interval 10
 ```
 
-持续运行 24~48 小时，观察日志中的统计数据：
+持续运行 24~48 小时，观察日志：
 
 ```
+# DEX 套利日志
 [DRY RUN] 会执行套利: 在 velodrome 买, 在 uniswap 卖, 净利=$0.08
 跳过套利: 净利润为负 ($-0.02)
+
+# 三明治日志
+发现大额 swap: exactInputSingle DEX=uniswap 金额=8500.00
+[DRY RUN] 三明治 #1: 价格影响=0.1823%, frontrun=2550.00, 净利=$3.21
+跳过三明治: 价格影响太小 (0.0031% < 0.1000%)
 ```
 
-**判断是否值得真实部署的指标：**
+**判断是否值得真实部署：**
 
-| 指标 | 建议标准 |
-|------|---------|
-| 每天触发信号次数 | 越多越好 |
-| 净利润 > 0 的占比 | > 20% 才值得部署 |
-| 平均净利润 | 需覆盖部署合约的 Gas 成本 |
+| 策略 | 指标 | 建议标准 |
+|------|------|---------|
+| DEX 套利 | 净利润 > 0 的信号占比 | > 20% |
+| DEX 套利 | 平均净利润 | 覆盖合约部署 Gas 成本 |
+| 三明治 | 每天捕获大额 swap 次数 | > 5 次/天 |
+| 三明治 | 净利润 > 0 的占比 | > 15%（高风险策略门槛更低） |
+| 三明治 | 平均净利润 | > $1/次（覆盖潜在 frontrun 亏损） |
 
 ---
 
 ### 第四阶段：小额真实执行
 
-Dry-run 数据良好后才进入此阶段：
+Dry-run 数据满足上述标准后才进入：
 
 ```bash
-# 1. 填写私钥和 Alchemy RPC
+# 1. 填写私钥和 Alchemy RPC（需要 WebSocket）
 vim .env
 
 # 2. 部署合约（约 $0.5 Gas）
@@ -235,14 +302,16 @@ vim .env
 
 # 3. 将合约地址填入 .env 的 ARBITRAGE_CONTRACT
 
-# 4. preflight 检查
+# 4. preflight 全面检查
 python scripts/preflight.py
 
-# 5. 启动（ARBITRAGE_CONTRACT 有值后自动退出 dry-run 模式）
+# 5. 启动（有合约地址后自动退出 dry-run 模式）
 python main.py --poll
 ```
 
-建议初始资金：**$50~$100 USDC + 0.02 ETH**，验证逻辑后再加仓。
+建议初始资金：**$50~$100 USDC + 0.02 ETH**，验证逻辑后再增加。
+
+> **三明治攻击额外提示**：首次启用建议将 `frontrun_ratio` 调低至 0.1（10%），降低单次失败损失上限，观察成功率后再调整。
 
 ## 项目结构
 
