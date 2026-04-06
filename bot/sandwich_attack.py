@@ -1,33 +1,35 @@
 """
-三明治攻击策略
+Backrun 策略（Optimism 适配版）
 
-什么是三明治攻击？
-    想象你在排队买东西，有人看到你要买很多某个商品（会推高价格），
-    于是他在你前面先买了一些（frontrun），等你的大单把价格推高后，
-    他再以更高的价格卖出（backrun）。差价就是他的利润。
+为什么在 Optimism 上不做 frontrun？
+    Optimism 使用单一 Sequencer，交易按到达顺序（FIFO）排列，
+    不像 L1 那样按 Gas Price 排序。出更高的 Gas 无法插到别人前面。
 
-    在 DEX 上：
-    1. 受害者发出一笔大额 swap（还在 mempool 里，没上链）
-    2. 我们看到后，发送 frontrun 交易：同方向买入（推高价格）
-    3. 受害者的交易以更高价格成交（他多付了钱）
-    4. 我们发送 backrun 交易：反方向卖出（以更高价格卖掉）
-    5. 我们的利润 = 卖出价 - 买入价 - Gas 费
+    "Op上不是谁最快，是谁更会跟" —— 正确策略是 backrun（跟跑）。
 
-关键区别（vs 套利）：
-    - 套利：一笔原子交易（买+卖），失败只亏 Gas
-    - 三明治：两笔独立交易（frontrun + backrun），有更多风险：
-      * 受害者交易可能不上链（我们的 frontrun 就白做了）
-      * 另一个 MEV bot 可能抢在我们前面
-      * 价格影响估算不准可能导致亏损
+Backrun 套利的核心逻辑：
+    1. 监听 Mempool 中的大额 swap（受害者）
+    2. 预测受害者 swap 执行后的跨 DEX 价差：
+       - 受害者在 Uniswap 买了大量 WETH → Uniswap 的 WETH 价格上涨
+       - Velodrome 的 WETH 价格还没变
+       - 价差 = 机会
+    3. 立刻提交跟随套利：在 Velodrome 买入 WETH，在 Uniswap（价格已升）卖出
+    4. 本质上是"由 Mempool 信号触发的 DEX 套利"
 
-Optimism 上的特殊性：
-    - 单一 sequencer，FIFO 排序（先到先处理）
-    - 没有 L1 那样的 Gas 竞价机制
-    - 区块时间 2 秒，窗口很短
-    - Gas 费极低（< $0.01），降低了三明治的最低利润门槛
+与主动 DEX 套利的区别：
+    - 主动套利：轮询价差，等待机会被动出现（周期性）
+    - Backrun：预测大单将创造的机会，主动跟随（事件驱动）
+    → Backrun 能捕捉到大单后短暂出现、很快消失的价差窗口
+
+关键参数说明：
+    - backrun_ratio: 我们投入金额占受害者金额的比例（默认 30%）
+      太高会占用过多资金；太低利润不足覆盖 Gas
+    - min_predicted_spread: 最小预测价差阈值（默认 0.2%）
+      比轮询套利阈值略高，因为预测本身有误差
 
 使用方式：
     sandwich = SandwichStrategy(conn, uni, velo, gas_estimator, config)
+    sandwich.on_backrun = executor.execute  # 连接执行器
     mempool_monitor.on_large_swap = sandwich.evaluate
 """
 
@@ -36,9 +38,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from bot.dex_arbitrage import TradeDecision
 from contracts.uniswap_v3 import UniswapV3
 from contracts.velodrome import Velodrome
 from data.mempool_monitor import PendingSwap
+from data.price_monitor import ArbitrageOpportunity
 from utils.config import Config
 from utils.gas_estimator import GasEstimator
 from utils.web3_utils import ChainConnection
@@ -49,14 +53,14 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SandwichOpportunity:
     """
-    一次三明治攻击机会的分析结果。
+    Backrun 机会分析结果。
 
-    包含了前置交易和后置交易的所有参数。
+    包含受害者 swap 信息、预测价差，以及我们将执行的 backrun 参数。
     """
 
     timestamp: float
 
-    # 受害者交易信息
+    # 受害者信息
     victim_tx_hash: str
     victim_dex: str
     victim_token_in: str
@@ -64,43 +68,42 @@ class SandwichOpportunity:
     victim_amount_in: int
     victim_amount_in_human: float
 
-    # 前置交易参数（frontrun）
-    frontrun_token_in: str      # 和受害者同方向买入
-    frontrun_token_out: str
-    frontrun_amount_in: int
-    frontrun_amount_in_human: float
-    frontrun_expected_out: int   # 预期换到的数量
+    # 预测分析
+    predicted_spread: float       # 受害者执行后预测的跨 DEX 价差
+    victim_implied_rate: float    # 受害者隐含执行价（tokenIn/tokenOut 人类单位）
+    other_dex_rate: float         # 另一个 DEX 当前价（tokenIn/tokenOut 人类单位）
 
-    # 后置交易参数（backrun）
-    backrun_token_in: str       # 把 frontrun 买到的卖回去
-    backrun_token_out: str
-    backrun_expected_out: int    # 预期换回的数量
+    # 我们的 backrun 参数
+    buy_dex: str                  # 在哪里买入 tokenOut
+    sell_dex: str                 # 在哪里卖出 tokenOut
+    our_amount_in_human: float    # 我们投入的金额
 
     # 利润分析
-    price_impact: float          # 受害者交易的价格影响（百分比）
-    estimated_profit: float      # 预估利润（token_in 最小单位）
-    estimated_profit_usd: float  # 预估利润（USD）
-    gas_cost_usd: float          # Gas 成本（两笔交易）
-    net_profit_usd: float        # 净利润
+    estimated_profit_usd: float
+    gas_cost_usd: float
+    net_profit_usd: float
 
 
 @dataclass
 class SandwichDecision:
-    """三明治攻击决策"""
+    """Backrun 决策结果（含统计信息和实际执行指令）"""
 
     timestamp: float
     action: str  # "execute" 或 "skip"
     reason: str
     opportunity: Optional[SandwichOpportunity] = None
+    trade_decision: Optional[TradeDecision] = None  # 实际传给 Executor 的指令
 
 
 class SandwichStrategy:
     """
-    三明治攻击决策引擎。
+    Backrun 策略引擎（Optimism 适配版）。
+
+    只做 backrun，不做 frontrun。
 
     决策流程：
     ┌─────────────────────────┐
-    │ 收到大额 swap 信号       │ ← MempoolMonitor
+    │ 收到大额 pending swap    │ ← MempoolMonitor
     └──────────┬──────────────┘
                ↓
     ┌─────────────────────────┐
@@ -108,19 +111,15 @@ class SandwichStrategy:
     └──────────┬──────────────┘
                ↓ 是
     ┌─────────────────────────┐
-    │ 计算价格影响             │ → 影响太小 → 跳过
+    │ 预测执行后跨 DEX 价差    │ → 价差太小 → 跳过
     └──────────┬──────────────┘
-               ↓
+               ↓ 价差够大
     ┌─────────────────────────┐
-    │ 模拟 frontrun 利润       │
+    │ 计算净利润               │ → 净利润 ≤ 0 → 跳过
     └──────────┬──────────────┘
-               ↓
+               ↓ 有利润
     ┌─────────────────────────┐
-    │ 净利润 > 0?             │ → 否 → 跳过
-    └──────────┬──────────────┘
-               ↓ 是
-    ┌─────────────────────────┐
-    │ 生成 frontrun + backrun  │ → 传给执行器
+    │ 生成 TradeDecision       │ → on_backrun → TransactionExecutor
     └─────────────────────────┘
     """
 
@@ -139,18 +138,18 @@ class SandwichStrategy:
         self.config = config
         self.strategy = config.strategy
 
-        # frontrun 金额占受害者交易的比例
-        # 太高会被检测到；太低利润不够
-        self.frontrun_ratio = 0.3  # 用受害者金额的 30%
+        # Backrun 金额占受害者金额的比例
+        # 30% 是平衡"利润空间"和"占用资金"的经验值
+        self.backrun_ratio = 0.3
 
-        # 最小价格影响阈值（低于此值利润太薄）
-        self.min_price_impact = 0.001  # 0.1%
+        # 最小预测价差阈值
+        # 设为 0.2%（略高于轮询套利的 0.3% min_profit_threshold，因为预测有误差）
+        self.min_predicted_spread = 0.002
 
-        # 执行回调
-        self.on_frontrun: Optional[callable] = None
+        # Backrun 执行回调（在 BotManager 中设置为 executor.execute）
         self.on_backrun: Optional[callable] = None
 
-        # dry run 模式（默认开启）
+        # dry run 模式（默认开启，安全第一）
         self.dry_run = True
 
         # 统计
@@ -167,7 +166,7 @@ class SandwichStrategy:
 
     async def evaluate(self, pending_swap: PendingSwap) -> SandwichDecision:
         """
-        评估一笔 pending swap 是否值得三明治攻击。
+        评估一笔 pending swap 是否值得 backrun。
 
         这是被 MempoolMonitor 调用的入口方法。
         """
@@ -175,7 +174,7 @@ class SandwichStrategy:
         now = time.time()
 
         logger.info(
-            "评估三明治 #%d: DEX=%s, 金额=%.2f, tx=%s",
+            "评估 Backrun #%d: DEX=%s, 金额=%.2f, tx=%s",
             self.total_signals, pending_swap.dex,
             pending_swap.amount_in_human, pending_swap.tx_hash[:18],
         )
@@ -184,263 +183,227 @@ class SandwichStrategy:
         if not self.gas_estimator.is_gas_acceptable():
             return self._skip("Gas 价格过高", now)
 
-        # ---- 检查 2: 估算受害者交易的价格影响 ----
-        price_impact = self._estimate_price_impact(pending_swap)
-        if price_impact is None:
-            return self._skip("无法估算价格影响", now)
+        # ---- 检查 2: 预测受害者执行后的跨 DEX 价差 ----
+        spread_info = self._predict_post_swap_spread(pending_swap)
+        if spread_info is None:
+            return self._skip("无法预测价差", now)
 
-        if price_impact < self.min_price_impact:
+        predicted_spread, buy_dex, sell_dex, our_amount_in_raw, victim_rate, other_rate = spread_info
+
+        logger.info(
+            "预测价差: %.4f%%, buy=%s, sell=%s",
+            predicted_spread * 100, buy_dex, sell_dex,
+        )
+
+        if predicted_spread < self.min_predicted_spread:
             return self._skip(
-                f"价格影响太小 ({price_impact:.4%} < {self.min_price_impact:.4%})",
+                f"预测价差太小 ({predicted_spread:.4%} < {self.min_predicted_spread:.4%})",
                 now,
             )
 
-        # ---- 检查 3: 计算 frontrun 参数和预期利润 ----
-        opportunity = self._calculate_opportunity(
-            pending_swap, price_impact, now
-        )
-        if opportunity is None:
-            return self._skip("无法计算利润", now)
+        # ---- 检查 3: 计算净利润 ----
+        token_in_decimals = self._get_decimals(pending_swap.token_in)
+        our_amount_human = our_amount_in_raw / 10 ** token_in_decimals
 
-        # ---- 检查 4: 净利润 > 0？----
-        if opportunity.net_profit_usd <= 0:
+        eth_price_usd = self._get_eth_price_usd()
+
+        # 估算利润 = 投入金额 × 预测价差
+        # token_in 是 USDC（稳定币）时直接用美元；是 WETH 时换算
+        if token_in_decimals == 18:
+            estimated_profit_usd = our_amount_human * predicted_spread * eth_price_usd
+        else:
+            estimated_profit_usd = our_amount_human * predicted_spread
+
+        gas_cost_usd = self.gas_estimator.estimate_arbitrage_cost_eth() * eth_price_usd
+        net_profit_usd = estimated_profit_usd - gas_cost_usd
+
+        if net_profit_usd <= 0:
             return self._skip(
-                f"净利润为负 (${opportunity.net_profit_usd:.4f})",
-                now, opportunity,
+                f"净利润为负 (${net_profit_usd:.4f})",
+                now,
             )
 
-        # ---- 通过所有检查，准备执行 ----
+        # ---- 构造 backrun 机会记录 ----
+        opportunity = SandwichOpportunity(
+            timestamp=now,
+            victim_tx_hash=pending_swap.tx_hash,
+            victim_dex=pending_swap.dex,
+            victim_token_in=pending_swap.token_in,
+            victim_token_out=pending_swap.token_out,
+            victim_amount_in=pending_swap.amount_in,
+            victim_amount_in_human=pending_swap.amount_in_human,
+            predicted_spread=predicted_spread,
+            victim_implied_rate=victim_rate,
+            other_dex_rate=other_rate,
+            buy_dex=buy_dex,
+            sell_dex=sell_dex,
+            our_amount_in_human=our_amount_human,
+            estimated_profit_usd=estimated_profit_usd,
+            gas_cost_usd=gas_cost_usd,
+            net_profit_usd=net_profit_usd,
+        )
+
+        # ---- 构造 TradeDecision（和 DexArbitrage 一样的结构，交给 Executor 执行）----
+        # Backrun 本质上就是一笔 DEX 套利，只是触发来源是 Mempool 信号
+        arb_opp = ArbitrageOpportunity(
+            timestamp=now,
+            token_in=pending_swap.token_in,
+            token_out=pending_swap.token_out,
+            amount_in_human=our_amount_human,
+            buy_dex=buy_dex,
+            sell_dex=sell_dex,
+            buy_price=1.0 / victim_rate if victim_rate > 0 else 0,
+            sell_price=1.0 / other_rate if other_rate > 0 else 0,
+            spread=predicted_spread,
+            estimated_profit=0,
+        )
+
+        trade_decision = TradeDecision(
+            timestamp=now,
+            action="execute",
+            reason=f"Backrun: victim={pending_swap.tx_hash[:10]}, 预测价差={predicted_spread:.4%}",
+            opportunity=arb_opp,
+            gas_cost_eth=self.gas_estimator.estimate_arbitrage_cost_eth(),
+            gas_cost_usd=gas_cost_usd,
+            net_profit_usd=net_profit_usd,
+            token_in=pending_swap.token_in,
+            token_out=pending_swap.token_out,
+            amount_in=our_amount_in_raw,
+            min_amount_out=0,  # 链上合约负责利润检查
+            buy_dex=buy_dex,
+            sell_dex=sell_dex,
+        )
+
         self.total_executions += 1
         decision = SandwichDecision(
             timestamp=now,
             action="execute",
             reason="净利润为正",
             opportunity=opportunity,
+            trade_decision=trade_decision,
         )
         self._append_decision(decision)
 
         if self.dry_run:
             logger.info(
-                "[DRY RUN] 三明治 #%d: 价格影响=%.4f%%, "
-                "frontrun=%.2f, 净利=$%.4f",
-                self.total_executions, price_impact * 100,
-                opportunity.frontrun_amount_in_human,
-                opportunity.net_profit_usd,
+                "[DRY RUN] Backrun #%d: victim=%s, 预测价差=%.4f%%, 净利=$%.4f",
+                self.total_executions, pending_swap.tx_hash[:10],
+                predicted_spread * 100, net_profit_usd,
             )
         else:
             logger.info(
-                "执行三明治 #%d: 价格影响=%.4f%%, "
-                "frontrun=%.2f, 净利=$%.4f",
-                self.total_executions, price_impact * 100,
-                opportunity.frontrun_amount_in_human,
-                opportunity.net_profit_usd,
+                "执行 Backrun #%d: victim=%s, 预测价差=%.4f%%, 净利=$%.4f",
+                self.total_executions, pending_swap.tx_hash[:10],
+                predicted_spread * 100, net_profit_usd,
             )
-            if self.on_frontrun:
-                await self.on_frontrun(opportunity)
+            if self.on_backrun:
+                await self.on_backrun(trade_decision)
 
         return decision
 
-    def _estimate_price_impact(self, swap: PendingSwap) -> Optional[float]:
+    # ============================================================
+    # 核心逻辑：预测受害者执行后的跨 DEX 价差
+    # ============================================================
+
+    def _predict_post_swap_spread(
+        self, swap: PendingSwap
+    ) -> Optional[tuple[float, str, str, int, float, float]]:
         """
-        估算受害者交易对价格的影响。
+        预测受害者 swap 执行后的跨 DEX 价差。
 
-        方法：
-        1. 查当前报价（用小额度）
-        2. 查受害者的大额度报价
-        3. 比较两个报价的差异
+        核心思路（以受害者在 Uniswap 买 WETH 为例）：
 
-        价格影响 = (小额单价 - 大额单价) / 小额单价
+        1. 调用 uniswap.get_quote(USDC, WETH, victim_amount) → victim_weth_out
+           这个 quote 模拟了受害者的完整交易，反映了受害者的平均执行价格：
+           victim_implied_rate = victim_amount_usdc / victim_weth_out
 
-        例如：
-        - 1 USDC → 0.000500 WETH（小额）
-        - 10000 USDC → 0.004990 WETH（大额，单价更差）
-        - 价格影响 = (0.000500 - 0.000499) / 0.000500 = 0.2%
+        2. 查 Velodrome 当前价格（还没被受害者影响）：
+           velodrome_rate = 1 / velodrome.get_price(USDC, WETH, 1.0)
 
-        价格影响越大，三明治攻击的利润空间越大。
+        3. 如果 victim_implied_rate > velodrome_rate：
+           说明受害者把 Uniswap 上的 WETH 价格推高了
+           → 我们应该：在 Velodrome 买 WETH（便宜），在 Uniswap 卖 WETH（贵）
+
+        注意：victim_implied_rate 是均价（不是边际价格），实际机会略大于预测。
+        这是保守估算，用于过滤明显无利润的情况。
+
+        返回：(spread, buy_dex, sell_dex, our_amount_in_raw, victim_rate, other_rate)
+        或 None（无法计算时）
         """
         try:
-            # 确定使用哪个 DEX 查价
-            if swap.dex == "uniswap":
-                dex = self.uniswap
+            victim_dex_obj = self.uniswap if swap.dex == "uniswap" else self.velodrome
+            other_dex_obj = self.velodrome if swap.dex == "uniswap" else self.uniswap
+            other_dex_name = "velodrome" if swap.dex == "uniswap" else "uniswap"
+
+            token_in_decimals = self._get_decimals(swap.token_in)
+            token_out_decimals = self._get_decimals(swap.token_out)
+
+            # Step 1: 受害者 DEX 上的执行 quote（模拟受害者的完整交易）
+            victim_amount_out_raw = victim_dex_obj.get_quote(
+                swap.token_in, swap.token_out, swap.amount_in
+            )
+            if not victim_amount_out_raw or victim_amount_out_raw == 0:
+                logger.debug("无法获取受害者 DEX quote")
+                return None
+
+            # 受害者的隐含执行价格（人类单位：tokenIn per tokenOut）
+            # 例如：10000 USDC / 4.7 WETH = 2128 USDC/WETH
+            victim_in_human = swap.amount_in / 10 ** token_in_decimals
+            victim_out_human = victim_amount_out_raw / 10 ** token_out_decimals
+            if victim_out_human == 0:
+                return None
+            victim_rate = victim_in_human / victim_out_human  # tokenIn per tokenOut
+
+            # Step 2: 另一个 DEX 当前价格
+            # get_price(tokenIn, tokenOut, 1.0) → amount_out_human（tokenOut per 1 tokenIn）
+            other_price = other_dex_obj.get_price(
+                swap.token_in, swap.token_out,
+                1.0, token_in_decimals, token_out_decimals,
+            )
+            if not other_price or other_price == 0:
+                logger.debug("无法获取另一 DEX 价格")
+                return None
+
+            other_rate = 1.0 / other_price  # tokenIn per tokenOut（与 victim_rate 单位一致）
+
+            # Step 3: 计算价差和方向
+            if victim_rate > other_rate:
+                # 受害者推高了 victim_dex 上 tokenOut 的价格
+                # → tokenOut 在 victim_dex 更贵，在 other_dex 更便宜
+                # → 在 other_dex 买入 tokenOut，在 victim_dex 卖出
+                spread = (victim_rate - other_rate) / other_rate
+                buy_dex = other_dex_name
+                sell_dex = swap.dex
             else:
-                dex = self.velodrome
+                # 反向情况（受害者在 victim_dex 卖出 tokenIn，使 tokenOut 变便宜）
+                spread = (other_rate - victim_rate) / victim_rate
+                buy_dex = swap.dex
+                sell_dex = other_dex_name
 
-            token_in_decimals = self._get_decimals(swap.token_in)
-            token_out_decimals = self._get_decimals(swap.token_out)
-
-            # 小额查价（基准价格）
-            small_amount = 1.0  # 1 个 token
-            small_price = dex.get_price(
-                swap.token_in, swap.token_out,
-                small_amount,
-                token_in_decimals, token_out_decimals,
-            )
-
-            # 大额查价（受害者的交易量）
-            large_price = dex.get_price(
-                swap.token_in, swap.token_out,
-                swap.amount_in_human,
-                token_in_decimals, token_out_decimals,
-            )
-
-            if small_price is None or large_price is None:
-                return None
-            if small_price == 0:
-                return None
-
-            # 换算为单位价格
-            small_unit_price = small_price / small_amount
-            large_unit_price = large_price / swap.amount_in_human
-
-            # 价格影响 = 大单比小单单价差多少
-            impact = (small_unit_price - large_unit_price) / small_unit_price
-
-            logger.debug(
-                "价格影响估算: 小额单价=%.8f, 大额单价=%.8f, 影响=%.4f%%",
-                small_unit_price, large_unit_price, impact * 100,
-            )
-            return abs(impact)
-
-        except Exception as e:
-            logger.error("价格影响估算失败: %s", e)
-            return None
-
-    def _calculate_opportunity(
-        self,
-        swap: PendingSwap,
-        price_impact: float,
-        timestamp: float,
-    ) -> Optional[SandwichOpportunity]:
-        """
-        计算三明治攻击的完整参数和预期利润。
-
-        核心思路：
-        1. 我们用 frontrun_ratio * 受害者金额 做 frontrun（同方向买入）
-        2. 受害者交易推高价格
-        3. 我们把买到的东西卖回去（backrun）
-        4. 利润 ≈ frontrun_amount * price_impact（简化估算）
-
-        为什么利润 ≈ frontrun_amount * price_impact？
-        - 我们以当前价格买入
-        - 受害者交易推高了 price_impact 的价格
-        - 我们以更高的价格卖出
-        - 价差 ≈ price_impact
-        """
-        try:
-            token_in_decimals = self._get_decimals(swap.token_in)
-            token_out_decimals = self._get_decimals(swap.token_out)
-
-            # frontrun 金额
-            frontrun_amount_human = swap.amount_in_human * self.frontrun_ratio
-
-            # 限制在策略配置的范围内
-            frontrun_amount_human = min(
-                frontrun_amount_human,
+            # Step 4: 计算我们的投入金额
+            our_amount_human = min(
+                swap.amount_in_human * self.backrun_ratio,
                 self.strategy.max_trade_amount,
             )
-            frontrun_amount_human = max(
-                frontrun_amount_human,
-                self.strategy.min_trade_amount,
+            our_amount_human = max(our_amount_human, self.strategy.min_trade_amount)
+            our_amount_in_raw = int(our_amount_human * 10 ** token_in_decimals)
+
+            logger.debug(
+                "Backrun 预测: victim_rate=%.4f, other_rate=%.4f, "
+                "spread=%.4f%%, buy=%s, sell=%s, amount=%.2f",
+                victim_rate, other_rate, spread * 100,
+                buy_dex, sell_dex, our_amount_human,
             )
 
-            frontrun_amount_raw = int(
-                frontrun_amount_human * (10 ** token_in_decimals)
-            )
-
-            # 模拟 frontrun：查当前报价
-            if swap.dex == "uniswap":
-                frontrun_out = self.uniswap.get_quote(
-                    swap.token_in, swap.token_out,
-                    frontrun_amount_raw,
-                )
-            else:
-                frontrun_out = self.velodrome.get_quote(
-                    swap.token_in, swap.token_out,
-                    frontrun_amount_raw,
-                )
-
-            if frontrun_out is None or frontrun_out == 0:
-                return None
-
-            # 模拟 backrun：用同一个 DEX 把买到的卖回去
-            # 注意：这里的报价不包含受害者交易的价格影响，
-            # 实际 backrun 时价格会更高（对我们有利），所以这是保守估算
-            if swap.dex == "uniswap":
-                backrun_out = self.uniswap.get_quote(
-                    swap.token_out, swap.token_in,
-                    frontrun_out,
-                )
-            else:
-                backrun_out = self.velodrome.get_quote(
-                    swap.token_out, swap.token_in,
-                    frontrun_out,
-                )
-
-            if backrun_out is None:
-                return None
-
-            # 利润 = backrun 换回的 - frontrun 花出去的
-            # 这是保守估算，因为 backrun 时价格比现在高
-            # 实际利润 ≈ profit_conservative + frontrun_amount * price_impact
-            profit_conservative = backrun_out - frontrun_amount_raw
-            profit_from_impact = frontrun_amount_raw * price_impact
-
-            # 取两者中间值作为预估
-            estimated_profit = profit_conservative + int(profit_from_impact * 0.5)
-
-            # 转换为 USD
-            estimated_profit_human = estimated_profit / (10 ** token_in_decimals)
-
-            # 如果 token_in 不是稳定币，需要换算
-            if token_in_decimals == 18:
-                # token_in 是 WETH 或类似 18 decimals 的代币
-                eth_price = self._get_eth_price_usd()
-                estimated_profit_usd = estimated_profit_human * eth_price
-            else:
-                # 假设是稳定币（USDC/USDT, 6 decimals）
-                estimated_profit_usd = estimated_profit_human
-
-            # Gas 成本（两笔交易）
-            gas_cost_eth = self.gas_estimator.estimate_swap_cost_eth() * 2
-            eth_price = self._get_eth_price_usd()
-            gas_cost_usd = gas_cost_eth * eth_price
-
-            net_profit_usd = estimated_profit_usd - gas_cost_usd
-
-            logger.info(
-                "三明治利润分析: 保守利润=%.4f, 影响利润=%.4f, "
-                "Gas=$%.4f, 净利=$%.4f",
-                profit_conservative / (10 ** token_in_decimals),
-                profit_from_impact / (10 ** token_in_decimals),
-                gas_cost_usd, net_profit_usd,
-            )
-
-            return SandwichOpportunity(
-                timestamp=timestamp,
-                victim_tx_hash=swap.tx_hash,
-                victim_dex=swap.dex,
-                victim_token_in=swap.token_in,
-                victim_token_out=swap.token_out,
-                victim_amount_in=swap.amount_in,
-                victim_amount_in_human=swap.amount_in_human,
-                frontrun_token_in=swap.token_in,
-                frontrun_token_out=swap.token_out,
-                frontrun_amount_in=frontrun_amount_raw,
-                frontrun_amount_in_human=frontrun_amount_human,
-                frontrun_expected_out=frontrun_out,
-                backrun_token_in=swap.token_out,
-                backrun_token_out=swap.token_in,
-                backrun_expected_out=backrun_out,
-                price_impact=price_impact,
-                estimated_profit=estimated_profit,
-                estimated_profit_usd=estimated_profit_usd,
-                gas_cost_usd=gas_cost_usd,
-                net_profit_usd=net_profit_usd,
-            )
+            return spread, buy_dex, sell_dex, our_amount_in_raw, victim_rate, other_rate
 
         except Exception as e:
-            logger.error("三明治利润计算失败: %s", e)
+            logger.error("预测价差失败: %s", e)
             return None
+
+    # ============================================================
+    # 辅助方法
+    # ============================================================
 
     def _skip(
         self,
@@ -450,7 +413,7 @@ class SandwichStrategy:
     ) -> SandwichDecision:
         """构造一个"跳过"决策"""
         self.total_skips += 1
-        logger.info("跳过三明治: %s", reason)
+        logger.info("跳过 Backrun: %s", reason)
 
         decision = SandwichDecision(
             timestamp=timestamp,
@@ -462,18 +425,13 @@ class SandwichStrategy:
         return decision
 
     def _append_decision(self, decision: SandwichDecision) -> None:
-        """保存决策到历史记录，超过上限时丢弃最早的"""
+        """保存决策记录，超过上限时丢弃最早的"""
         self.decisions.append(decision)
         if len(self.decisions) > self._max_decisions:
             self.decisions = self.decisions[-self._max_decisions:]
 
     def _get_decimals(self, token_addr: str) -> int:
-        """
-        获取代币精度。
-
-        已知代币直接返回，未知代币默认 18。
-        （生产环境应该从合约读取 decimals()，这里简化处理）
-        """
+        """获取代币精度，未知代币默认 18"""
         known = {
             self.config.optimism.usdc.lower(): 6,
             self.config.optimism.usdt.lower(): 6,

@@ -9,9 +9,13 @@
 
 架构：
     BotManager
-    ├── PriceMonitor  → DexArbitrage → TransactionExecutor  (套利线)
-    ├── MempoolMonitor → SandwichStrategy                   (三明治线)
+    ├── PriceMonitor  → DexArbitrage → TransactionExecutor  (主动套利线：轮询价差)
+    ├── MempoolMonitor → SandwichStrategy(Backrun)           (被动 Backrun 线：跟随大单)
+    │                              ↘ TransactionExecutor    (两条线共用，统一 nonce 管理)
     └── 定期任务：健康检查 + 统计报告
+
+注意：Optimism 使用 FIFO Sequencer，无法用 Gas 插队做 frontrun。
+      SandwichStrategy 已改为 backrun-only 策略（跟随大单，不抢先）。
 
 使用方式：
     manager = BotManager(config)
@@ -167,14 +171,24 @@ class BotManager:
         await self.notifier.start()
 
         # 5. 连接回调链
+        #
+        # 套利线（主动，轮询/Swap事件驱动）：
         #   PriceMonitor → DexArbitrage → TransactionExecutor
         self.arb_strategy.on_trade = self.executor.execute
 
-        #   MempoolMonitor → SandwichStrategy
         self.price_monitor = PriceMonitor(
             self.conn, self.uniswap, self.velodrome, self.config,
         )
         self.price_monitor.on_opportunity = self.arb_strategy.evaluate
+
+        # Backrun 线（被动，Mempool 事件驱动）：
+        #   MempoolMonitor → SandwichStrategy（Backrun）→ TransactionExecutor
+        #
+        # 为什么两条线共用同一个 Executor？
+        #   Backrun 本质上也是一笔 DEX 套利交易，
+        #   只是触发来源从"价差信号"变成了"大额 pending swap 信号"。
+        #   共用 Executor 可以统一 nonce 管理，防止两条线并发时 nonce 冲突。
+        self.sandwich_strategy.on_backrun = self.executor.execute
 
         self.mempool_monitor = MempoolMonitor(self.conn, self.config)
         self.mempool_monitor.on_large_swap = self.sandwich_strategy.evaluate
